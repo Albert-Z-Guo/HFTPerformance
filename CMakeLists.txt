@@ -176,6 +176,7 @@ target_link_libraries(order_gateway PRIVATE
 add_executable(hftperf
     src/apps/hftperf_main.cpp
     src/strategy/user_strategy.cpp
+    src/strategy/lob_exit_strategy.cpp
 )
 target_link_libraries(hftperf PRIVATE
     hft_matching

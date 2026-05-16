@@ -450,6 +450,9 @@ private:
     Quantity quote_size_ = 10;
 };
 
+// Forward declaration — implemented in lob_exit_strategy.cpp (linked into hftperf).
+std::unique_ptr<UserStrategy> create_lob_exit_strategy();
+
 /**
  * @brief Factory function to create strategies by name
  */
@@ -460,6 +463,8 @@ inline std::unique_ptr<UserStrategy> create_strategy(const std::string& name) {
         return std::make_unique<MomentumStrategy>();
     } else if (name == "market_making" || name == "MarketMaking") {
         return std::make_unique<MarketMakingStrategy>();
+    } else if (name == "lob_exit" || name == "LOBExitStrategy") {
+        return create_lob_exit_strategy();
     }
     // Default to pass-through
     return std::make_unique<PassThroughStrategy>();
