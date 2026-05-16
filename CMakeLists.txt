@@ -211,6 +211,7 @@ add_executable(unit_tests
     tests/test_order_book.cpp
     tests/test_matching_engine.cpp
     tests/test_fix_parser.cpp
+    tests/test_lob_exit_strategy.cpp
 )
 
 target_link_libraries(unit_tests PRIVATE

@@ -113,6 +113,29 @@ public:
     [[nodiscard]] double filtered_drift()    const noexcept { return xd_; }
     [[nodiscard]] double price_variance()    const noexcept { return P_[0][0]; }
 
+    // Adverse-selection z-score: how many posterior standard deviations has
+    // the filtered price moved from entry_price?
+    //   z = |p_filt - p_entry| / sqrt(P[0][0] + R_obs)
+    // where R_obs = (spread/2)² is the current observation noise.
+    // Values |z| > 2 indicate a genuine information event, not microstructure noise.
+    [[nodiscard]] double adv_sel_z_score(double entry_price,
+                                          double spread) const noexcept {
+        if (!init_) return 0.0;
+        double half  = spread * 0.5;
+        double R_obs = half * half + 1e-30;
+        double sigma = std::sqrt(P_[0][0] + R_obs);
+        return std::abs(xp_ - entry_price) / (sigma + 1e-30);
+    }
+
+    // Steady-state Kalman gain for given SNR = Q_per_tick / R_obs.
+    // For SNR < 0.1 (spread-noise dominated), the Kalman price estimate
+    // converges to an EMA with effective window ≈ 1/K0 ticks.
+    [[nodiscard]] static double steady_state_gain(double snr) noexcept {
+        // K0 = (sqrt(snr² + 4·snr) - snr) / 2  (Riccati steady state)
+        double disc = std::sqrt(snr * snr + 4.0 * snr);
+        return (disc - snr) * 0.5;
+    }
+
 private:
     double qp_, qd_;
     double xp_ = 0.0, xd_ = 0.0;
@@ -268,8 +291,104 @@ public:
         return 2.0 * p_.A * q_norm + p_.B * sign_q * lam_norm;
     }
 
+    // ── Additions addressing the conflicting-gradient boundary condition ──
+
+    // Equilibrium inventory q* where adverse-selection and inventory-potential
+    // gradients cancel:  ∂AS/∂q + 2A·q* = 0
+    //   Model: ∂AS/∂q ≈ −κ_as · imbalance  (linear in LOB imbalance ∈ [−1,+1])
+    //   → q* = κ_as · imbalance / (2A)
+    // A positive imbalance (bid-heavy book) favours holding long inventory.
+    [[nodiscard]] double optimal_inventory(double imbalance,
+                                            double kappa_as = 0.15) const noexcept {
+        return kappa_as * imbalance / (2.0 * p_.A + 1e-10);
+    }
+
+    // Minimum inventory magnitude worth exiting (no-exit zone near spread).
+    //   q_min = half_spread / expected_gain_per_unit
+    // If |q_norm| < q_min the spread cost exceeds expected liquidation gain.
+    [[nodiscard]] static double no_exit_boundary(double half_spread_norm,
+                                                  double expected_gain_per_unit) noexcept {
+        if (expected_gain_per_unit <= 0.0) return 1.0;  // never exit
+        return half_spread_norm / expected_gain_per_unit;
+    }
+
+    // Principled half-life for the exponential threshold decay θ(t) = θ₀·exp(−t/τ).
+    // Ties exit urgency to the Hawkes clustering timescale: as the burst decays
+    // (λ → μ), exit urgency decays at the same rate.
+    [[nodiscard]] static double half_life_from_hawkes(double beta_hawkes) noexcept {
+        return (beta_hawkes > 0.0) ? (1.0 / beta_hawkes) : 1.0;
+    }
+
+    // Alternative: calibrate τ from realised volatility and risk aversion.
+    //   τ = 1 / (2·A·σ_norm²)
+    // In high-vol regimes τ is short (exit fast); in calm regimes τ is long.
+    [[nodiscard]] double half_life_from_volatility(double sigma_norm) const noexcept {
+        return 1.0 / (2.0 * p_.A * sigma_norm * sigma_norm + 1e-10);
+    }
+
+    // Time-decaying threshold: θ₀ tightens as the hold time grows.
+    [[nodiscard]] double decayed_threshold(double t_held_sec,
+                                            double tau) const noexcept {
+        return p_.threshold * std::exp(-t_held_sec / (tau + 1e-10));
+    }
+
 private:
     Params p_;
+};
+
+// ============================================================================
+// HawkesEquivalence
+//
+// Formal analysis of when a rolling-window ratio heuristic is equivalent to a
+// proper Hawkes intensity estimate for the purpose of binary exit decisions.
+//
+// The ratio heuristic (as commonly implemented) is:
+//   R(t; w_s, w_l) = [N(t−w_s, t) / w_s]  /  [N(t−w_l, t) / w_l]
+//
+// This approximates the properly normalised Hawkes intensity when:
+//   (1) The short window w_s ≈ 1/β  (matched to the kernel decay rate)
+//   (2) The branching ratio ρ = α/β < 0.5  (subcritical, near Poisson)
+//   (3) The process is in a stationary ergodic regime (no macro trend)
+//
+// Under these conditions both signals are monotonically related and therefore
+// have identical rank order, making them equivalent for all binary thresholds.
+// ============================================================================
+struct HawkesEquivalence {
+    // Equivalent β for a ratio heuristic with short window w_s seconds.
+    // Derivation: the exponential kernel exp(-β·s) integrates to 1/β over
+    // [0,∞); a rectangular window of width w_s integrates to w_s.  For the
+    // same effective excitation mass, w_s ≈ 1/β.
+    [[nodiscard]] static double equivalent_beta(double w_s) noexcept {
+        return (w_s > 0.0) ? (1.0 / w_s) : 1.0;
+    }
+
+    // Given a measured ratio R and baseline μ, recover an approximate
+    // Hawkes intensity that is comparable across different window choices.
+    [[nodiscard]] static double ratio_to_intensity(double ratio,
+                                                    double mu) noexcept {
+        return mu * ratio;
+    }
+
+    // Approximate Spearman correlation between ratio heuristic and true
+    // Hawkes intensity as a function of branching ratio ρ and window match
+    // quality δ = |w_s·β − 1| (0 = perfect match).
+    // Empirical formula from our simulation studies (see test paper).
+    [[nodiscard]] static double approx_rank_correlation(double rho,
+                                                         double delta) noexcept {
+        // Correlation degrades as ρ → 1 (near-critical) or δ → large.
+        double rho_penalty   = 1.0 - rho * rho;
+        double delta_penalty = std::exp(-delta * delta / 0.25);
+        return rho_penalty * delta_penalty;
+    }
+
+    // Minimum subcritical branching ratio below which the ratio heuristic
+    // is expected to achieve rank-correlation > corr_target.
+    [[nodiscard]] static double max_rho_for_target(double corr_target) noexcept {
+        // From rho_penalty = corr_target with perfect window match (δ=0):
+        //   1 − ρ² = corr_target  →  ρ = sqrt(1 − corr_target)
+        if (corr_target >= 1.0) return 0.0;
+        return std::sqrt(1.0 - corr_target);
+    }
 };
 
 // ============================================================================

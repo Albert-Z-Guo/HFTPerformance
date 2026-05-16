@@ -32,18 +32,20 @@ void run_memory_pool_tests();
 void run_order_book_tests();
 void run_matching_engine_tests();
 void run_fix_parser_tests();
+void run_lob_exit_strategy_tests();
 
 int main() {
     std::cout << "╔══════════════════════════════════════════════════════════════╗\n";
     std::cout << "║                    HFT Trading System Tests                   ║\n";
     std::cout << "╚══════════════════════════════════════════════════════════════╝\n\n";
-    
+
     try {
         run_lockfree_queue_tests();
         run_memory_pool_tests();
         run_order_book_tests();
         run_matching_engine_tests();
         run_fix_parser_tests();
+        run_lob_exit_strategy_tests();
     } catch (const std::exception& e) {
         std::cerr << "Test suite error: " << e.what() << "\n";
         return 1;
